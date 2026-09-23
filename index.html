@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>VR Firefly · WebXR Light Flock</title>
+  <style>
+    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color:#fff;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+    canvas{display:block}
+    #info{position:fixed;left:16px;top:16px;z-index:10;max-width:430px;padding:12px 14px;background:rgba(0,0,0,.58);border:1px solid rgba(255,255,255,.18);border-radius:10px;line-height:1.45;font-size:13px;pointer-events:none;user-select:none}
+    #status{opacity:.68;margin-top:6px}
+  </style>
+  <script type="importmap">
+  {
+    "imports":{
+      "three":"https://cdn.jsdelivr.net/npm/three@0.186.0/build/three.module.js",
+      "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.186.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="info">
+    <b>VR Firefly</b><br>
+    白色光点在玩家附近按 Boids 规则飞行。移动、探身和转头会扰动它们。
+    <div id="status">桌面预览模式</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+    const CONFIG={
+      count:240,
+      minSpeed:.28,maxSpeed:1.05,maxForce:1.55,
+      separationRadius:.22,alignmentRadius:.62,cohesionRadius:.78,
+      separationWeight:1.65,alignmentWeight:.72,cohesionWeight:.55,wanderWeight:.48,
+      preferredDistance:1.55,flockRadius:3.1,returnWeight:1.25,
+      headPersonalSpace:.42,headInfluenceRadius:1.35,
+      headRepelWeight:3.2,headMotionWeight:1.45,headTurnWeight:1.15,
+      pointSize:.055,opacity:.95
+    };
+
+    const scene=new THREE.Scene();
+    scene.background=new THREE.Color(0x000000);
+
+    const camera=new THREE.PerspectiveCamera(70,innerWidth/innerHeight,.01,100);
+    camera.position.set(0,1.6,0);
+
+    const renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});
+    renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+    renderer.setSize(innerWidth,innerHeight);
+    renderer.xr.enabled=true;
+    renderer.xr.setReferenceSpaceType('local-floor');
+    document.body.appendChild(renderer.domElement);
+    document.body.appendChild(VRButton.createButton(renderer));
+
+    const status=document.querySelector('#status');
+    renderer.xr.addEventListener('sessionstart',()=>status.textContent='VR 模式：头部运动正在影响光点');
+    renderer.xr.addEventListener('sessionend',()=>status.textContent='桌面预览模式');
+
+    function glowTexture(){
+      const s=128,c=document.createElement('canvas');c.width=c.height=s;
+      const x=c.getContext('2d');
+      const g=x.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);
+      g.addColorStop(0,'rgba(255,255,255,1)');
+      g.addColorStop(.16,'rgba(255,255,255,1)');
+      g.addColorStop(.38,'rgba(255,255,255,.55)');
+      g.addColorStop(.72,'rgba(255,255,255,.1)');
+      g.addColorStop(1,'rgba(255,255,255,0)');
+      x.fillStyle=g;x.fillRect(0,0,s,s);
+      const t=new THREE.CanvasTexture(c);t.colorSpace=THREE.SRGBColorSpace;return t;
+    }
+
+    const N=CONFIG.count;
+    const positions=new Float32Array(N*3);
+    const velocities=new Float32Array(N*3);
+    const phases=new Float32Array(N*3);
+
+    function unit(){
+      const z=Math.random()*2-1,a=Math.random()*Math.PI*2,r=Math.sqrt(Math.max(0,1-z*z));
+      return [r*Math.cos(a),z,r*Math.sin(a)];
+    }
+
+    for(let i=0;i<N;i++){
+      const k=i*3,d=unit(),r=.65+Math.pow(Math.random(),.65)*2.15;
+      positions[k]=d[0]*r;positions[k+1]=1.6+d[1]*r*.72;positions[k+2]=d[2]*r;
+      const v=unit(),s=CONFIG.minSpeed+Math.random()*.38;
+      velocities[k]=v[0]*s;velocities[k+1]=v[1]*s;velocities[k+2]=v[2]*s;
+      phases[k]=Math.random()*Math.PI*2;phases[k+1]=Math.random()*Math.PI*2;phases[k+2]=Math.random()*Math.PI*2;
+    }
+
+    const geometry=new THREE.BufferGeometry();
+    const posAttr=new THREE.BufferAttribute(positions,3);
+    posAttr.setUsage(THREE.DynamicDrawUsage);
+    geometry.setAttribute('position',posAttr);
+
+    const material=new THREE.PointsMaterial({
+      color:0xffffff,size:CONFIG.pointSize,map:glowTexture(),
+      transparent:true,opacity:CONFIG.opacity,depthWrite:false,
+      blending:THREE.AdditiveBlending,sizeAttenuation:true
+    });
+
+    const points=new THREE.Points(geometry,material);
+    points.frustumCulled=false;
+    scene.add(points);
+
+    const headPos=new THREE.Vector3(0,1.6,0);
+    const prevHeadPos=new THREE.Vector3(0,1.6,0);
+    const headVelocity=new THREE.Vector3();
+    const rawHeadVelocity=new THREE.Vector3();
+    const headForward=new THREE.Vector3(0,0,-1);
+    const prevHeadForward=new THREE.Vector3(0,0,-1);
+    const turnVelocity=new THREE.Vector3();
+    const rawTurnVelocity=new THREE.Vector3();
+    const quat=new THREE.Quaternion();
+    const targetCenter=new THREE.Vector3();
+    let first=true,elapsed=0;
+
+    function updateHead(dt,frame){
+      if(renderer.xr.isPresenting && frame){
+        const ref=renderer.xr.getReferenceSpace();
+        const pose=frame.getViewerPose(ref);
+        if(pose){
+          const p=pose.transform.position,q=pose.transform.orientation;
+          headPos.set(p.x,p.y,p.z);
+          quat.set(q.x,q.y,q.z,q.w);
+          headForward.set(0,0,-1).applyQuaternion(quat).normalize();
+        }
+      }else{
+        camera.getWorldPosition(headPos);
+        camera.getWorldDirection(headForward).normalize();
+      }
+
+      if(first||dt<=0){
+        prevHeadPos.copy(headPos);prevHeadForward.copy(headForward);
+        headVelocity.set(0,0,0);turnVelocity.set(0,0,0);first=false;return;
+      }
+
+      rawHeadVelocity.copy(headPos).sub(prevHeadPos).divideScalar(dt);
+      if(rawHeadVelocity.lengthSq()>16)rawHeadVelocity.setLength(4);
+      headVelocity.lerp(rawHeadVelocity,.28);
+
+      rawTurnVelocity.copy(headForward).sub(prevHeadForward).divideScalar(dt);
+      if(rawTurnVelocity.lengthSq()>25)rawTurnVelocity.setLength(5);
+      turnVelocity.lerp(rawTurnVelocity,.22);
+
+      prevHeadPos.copy(headPos);prevHeadForward.copy(headForward);
+    }
+
+    const sepR2=CONFIG.separationRadius**2;
+    const aliR2=CONFIG.alignmentRadius**2;
+    const cohR2=CONFIG.cohesionRadius**2;
+    const headR2=CONFIG.headInfluenceRadius**2;
+    const personalR2=CONFIG.headPersonalSpace**2;
+
+    function limit3(x,y,z,max){
+      const l2=x*x+y*y+z*z,m2=max*max;
+      if(l2>m2&&l2>0){const s=max/Math.sqrt(l2);return [x*s,y*s,z*s]}
+      return [x,y,z];
+    }
+
+    function updateFlock(dt){
+      targetCenter.copy(headForward).multiplyScalar(CONFIG.preferredDistance*.42).add(headPos);
+
+      for(let i=0;i<N;i++){
+        const ik=i*3,px=positions[ik],py=positions[ik+1],pz=positions[ik+2];
+        const vx=velocities[ik],vy=velocities[ik+1],vz=velocities[ik+2];
+
+        let sx=0,sy=0,sz=0,sc=0,axn=0,ayn=0,azn=0,ac=0,cx0=0,cy0=0,cz0=0,cc=0;
+
+        for(let j=0;j<N;j++){
+          if(i===j)continue;
+          const jk=j*3,dx=positions[jk]-px,dy=positions[jk+1]-py,dz=positions[jk+2]-pz;
+          const d2=dx*dx+dy*dy+dz*dz;
+
+          if(d2<sepR2&&d2>.000001){
+            const inv=1/d2;sx-=dx*inv;sy-=dy*inv;sz-=dz*inv;sc++;
+          }
+          if(d2<aliR2){
+            axn+=velocities[jk];ayn+=velocities[jk+1];azn+=velocities[jk+2];ac++;
+          }
+          if(d2<cohR2){
+            cx0+=positions[jk];cy0+=positions[jk+1];cz0+=positions[jk+2];cc++;
+          }
+        }
+
+        let ax=0,ay=0,az=0;
+
+        if(sc){
+          const f=limit3(sx/sc,sy/sc,sz/sc,CONFIG.maxForce);
+          ax+=f[0]*CONFIG.separationWeight;ay+=f[1]*CONFIG.separationWeight;az+=f[2]*CONFIG.separationWeight;
+        }
+        if(ac){
+          const f=limit3(axn/ac-vx,ayn/ac-vy,azn/ac-vz,CONFIG.maxForce);
+          ax+=f[0]*CONFIG.alignmentWeight;ay+=f[1]*CONFIG.alignmentWeight;az+=f[2]*CONFIG.alignmentWeight;
+        }
+        if(cc){
+          const f=limit3(cx0/cc-px,cy0/cc-py,cz0/cc-pz,CONFIG.maxForce);
+          ax+=f[0]*CONFIG.cohesionWeight;ay+=f[1]*CONFIG.cohesionWeight;az+=f[2]*CONFIG.cohesionWeight;
+        }
+
+        const wx=Math.sin(elapsed*.73+phases[ik])+Math.cos(elapsed*.31+phases[ik+1]*1.7);
+        const wy=Math.sin(elapsed*.57+phases[ik+1])+Math.cos(elapsed*.27+phases[ik+2]*1.3);
+        const wz=Math.sin(elapsed*.67+phases[ik+2])+Math.cos(elapsed*.35+phases[ik]*1.4);
+        ax+=wx*.5*CONFIG.wanderWeight;ay+=wy*.5*CONFIG.wanderWeight;az+=wz*.5*CONFIG.wanderWeight;
+
+        const cx=targetCenter.x-px,cy=targetCenter.y-py,cz=targetCenter.z-pz;
+        const cd=Math.sqrt(cx*cx+cy*cy+cz*cz);
+        if(cd>CONFIG.preferredDistance){
+          const t=Math.min(1,(cd-CONFIG.preferredDistance)/Math.max(.001,CONFIG.flockRadius-CONFIG.preferredDistance));
+          const w=CONFIG.returnWeight*(.25+1.75*t)/Math.max(cd,.001);
+          ax+=cx*w;ay+=cy*w;az+=cz*w;
+        }
+
+        const hx=px-headPos.x,hy=py-headPos.y,hz=pz-headPos.z,hd2=hx*hx+hy*hy+hz*hz;
+        if(hd2<headR2){
+          const hd=Math.sqrt(Math.max(hd2,.000001)),proximity=1-hd/CONFIG.headInfluenceRadius;
+
+          if(hd2<personalR2){
+            const personal=1-hd/CONFIG.headPersonalSpace,inv=1/hd;
+            ax+=hx*inv*CONFIG.headRepelWeight*personal;
+            ay+=hy*inv*CONFIG.headRepelWeight*personal;
+            az+=hz*inv*CONFIG.headRepelWeight*personal;
+          }
+
+          const hs=Math.min(2.5,headVelocity.length());
+          if(hs>.015){
+            ax+=headVelocity.x*CONFIG.headMotionWeight*proximity;
+            ay+=headVelocity.y*CONFIG.headMotionWeight*proximity;
+            az+=headVelocity.z*CONFIG.headMotionWeight*proximity;
+
+            const rx=headVelocity.y*hz-headVelocity.z*hy;
+            const ry=headVelocity.z*hx-headVelocity.x*hz;
+            const rz=headVelocity.x*hy-headVelocity.y*hx;
+            const rl=Math.sqrt(rx*rx+ry*ry+rz*rz);
+            if(rl>.00001){
+              const w=.34*proximity*hs;
+              ax+=rx/rl*w;ay+=ry/rl*w;az+=rz/rl*w;
+            }
+          }
+
+          if(turnVelocity.length()>.01){
+            const tx=turnVelocity.y*hz-turnVelocity.z*hy;
+            const ty=turnVelocity.z*hx-turnVelocity.x*hz;
+            const tz=turnVelocity.x*hy-turnVelocity.y*hx;
+            ax+=tx*CONFIG.headTurnWeight*proximity;
+            ay+=ty*CONFIG.headTurnWeight*proximity;
+            az+=tz*CONFIG.headTurnWeight*proximity;
+          }
+        }
+
+        [ax,ay,az]=limit3(ax,ay,az,CONFIG.maxForce*2.35);
+
+        let nvx=vx+ax*dt,nvy=vy+ay*dt,nvz=vz+az*dt;
+        let sp=Math.sqrt(nvx*nvx+nvy*nvy+nvz*nvz);
+        if(sp>CONFIG.maxSpeed){
+          const s=CONFIG.maxSpeed/sp;nvx*=s;nvy*=s;nvz*=s;
+        }else if(sp<CONFIG.minSpeed&&sp>.00001){
+          const s=CONFIG.minSpeed/sp;nvx*=s;nvy*=s;nvz*=s;
+        }
+
+        velocities[ik]=nvx;velocities[ik+1]=nvy;velocities[ik+2]=nvz;
+        positions[ik]=px+nvx*dt;positions[ik+1]=py+nvy*dt;positions[ik+2]=pz+nvz*dt;
+
+        if(cd>CONFIG.flockRadius*1.75){
+          positions[ik]+=cx*dt*1.8;positions[ik+1]+=cy*dt*1.8;positions[ik+2]+=cz*dt*1.8;
+        }
+      }
+
+      posAttr.needsUpdate=true;
+    }
+
+    let previous=performance.now();
+    renderer.setAnimationLoop((time,frame)=>{
+      let dt=(time-previous)/1000;previous=time;
+      dt=Math.min(Math.max(dt,.001),.035);elapsed+=dt;
+      updateHead(dt,frame);updateFlock(dt);renderer.render(scene,camera);
+    });
+
+    addEventListener('resize',()=>{
+      camera.aspect=innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth,innerHeight);
+    });
+  </script>
+</body>
+</html>
