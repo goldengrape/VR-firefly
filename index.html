@@ -106,6 +106,20 @@
         <input id="size" type="range" min="0.015" max="0.12" step="0.005" value="0.055">
       </div>
 
+      <div class="setting">
+        <label for="rightSummon">右手召唤强度</label>
+        <output id="rightSummonOut">1.00×</output>
+        <input id="rightSummon" type="range" min="0" max="3" step="0.05" value="1">
+        <div class="hint">右手附近的光点会被吸引，并在手边保持一个小范围环绕。</div>
+      </div>
+
+      <div class="setting">
+        <label for="leftRepel">左手排斥强度</label>
+        <output id="leftRepelOut">1.00×</output>
+        <input id="leftRepel" type="range" min="0" max="3" step="0.05" value="1">
+        <div class="hint">左手靠近会推开光点；快速挥动左手时会产生更明显的扫动效果。</div>
+      </div>
+
       <div class="actions">
         <button id="start">开始运行</button>
         <button id="reset" type="button">恢复默认</button>
@@ -115,7 +129,7 @@
 
   <div id="info">
     <b>VR Firefly</b><br>
-    白色光点在玩家附近按 Boids 规则飞行。移动、探身和转头会扰动它们。
+    白色光点按 Boids 规则飞行。右手召唤，左手排斥；头部运动也会扰动它们。
     <div id="status">模拟已运行</div>
   </div>
 
@@ -132,6 +146,8 @@
       preferredDistance:1.55,returnWeight:1.25,
       headPersonalSpace:.42,headInfluenceRadius:1.35,
       headRepelWeight:3.2,headMotionWeight:1.45,headTurnWeight:1.15,
+      rightSummonRadius:2.1,rightOrbitRadius:.28,rightSummonWeight:2.25,rightOrbitWeight:.55,
+      leftRepelRadius:1.55,leftRepelWeight:4.4,leftSweepWeight:1.65,
       opacity:.95
     };
 
@@ -142,6 +158,8 @@
       flockRadius:3.1,
       headScale:1,
       pointSize:.055,
+      rightSummonScale:1,
+      leftRepelScale:1,
       ...BASE
     };
 
@@ -158,16 +176,21 @@
       radius:document.querySelector('#radius'),
       head:document.querySelector('#head'),
       size:document.querySelector('#size'),
+      rightSummon:document.querySelector('#rightSummon'),
+      leftRepel:document.querySelector('#leftRepel'),
       countOut:document.querySelector('#countOut'),
       speedOut:document.querySelector('#speedOut'),
       wanderOut:document.querySelector('#wanderOut'),
       radiusOut:document.querySelector('#radiusOut'),
       headOut:document.querySelector('#headOut'),
-      sizeOut:document.querySelector('#sizeOut')
+      sizeOut:document.querySelector('#sizeOut'),
+      rightSummonOut:document.querySelector('#rightSummonOut'),
+      leftRepelOut:document.querySelector('#leftRepelOut')
     };
 
     const defaults={
-      count:'240',speed:'1',wander:'0.48',radius:'3.1',head:'1',size:'0.055'
+      count:'240',speed:'1',wander:'0.48',radius:'3.1',head:'1',size:'0.055',
+      rightSummon:'1',leftRepel:'1'
     };
 
     function syncOutputs(){
@@ -177,9 +200,11 @@
       ui.radiusOut.value=Number(ui.radius.value).toFixed(1)+' m';
       ui.headOut.value=Number(ui.head.value).toFixed(2)+'×';
       ui.sizeOut.value=Number(ui.size.value).toFixed(3);
+      ui.rightSummonOut.value=Number(ui.rightSummon.value).toFixed(2)+'×';
+      ui.leftRepelOut.value=Number(ui.leftRepel.value).toFixed(2)+'×';
     }
 
-    ['count','speed','wander','radius','head','size'].forEach(k=>{
+    ['count','speed','wander','radius','head','size','rightSummon','leftRepel'].forEach(k=>{
       ui[k].addEventListener('input',syncOutputs);
     });
     syncOutputs();
@@ -202,7 +227,7 @@
     document.body.appendChild(vrButton);
 
     renderer.xr.addEventListener('sessionstart',()=>{
-      ui.status.textContent='VR 模式：头部运动正在影响光点';
+      ui.status.textContent='VR 模式：右手召唤，左手排斥，头部运动也会扰动光点';
       ui.reopen.style.display='none';
     });
 
@@ -302,6 +327,8 @@
       CONFIG.flockRadius=Number(ui.radius.value);
       CONFIG.headScale=Number(ui.head.value);
       CONFIG.pointSize=Number(ui.size.value);
+      CONFIG.rightSummonScale=Number(ui.rightSummon.value);
+      CONFIG.leftRepelScale=Number(ui.leftRepel.value);
     }
 
     const headPos=new THREE.Vector3(0,1.6,0);
@@ -314,12 +341,78 @@
     const rawTurnVelocity=new THREE.Vector3();
     const quat=new THREE.Quaternion();
     const targetCenter=new THREE.Vector3();
+
+    function makeHandState(){
+      return {
+        active:false,
+        first:true,
+        pos:new THREE.Vector3(),
+        prevPos:new THREE.Vector3(),
+        velocity:new THREE.Vector3(),
+        rawVelocity:new THREE.Vector3()
+      };
+    }
+
+    const hands={
+      left:makeHandState(),
+      right:makeHandState()
+    };
+
+    function resetHands(){
+      for(const hand of Object.values(hands)){
+        hand.active=false;
+        hand.first=true;
+        hand.velocity.set(0,0,0);
+        hand.rawVelocity.set(0,0,0);
+      }
+    }
+
+    function updateHands(dt,frame){
+      for(const hand of Object.values(hands))hand.active=false;
+      if(!renderer.xr.isPresenting||!frame)return;
+
+      const ref=renderer.xr.getReferenceSpace();
+
+      for(const source of frame.session.inputSources){
+        if(source.handedness!=='left'&&source.handedness!=='right')continue;
+        const space=source.gripSpace||source.targetRaySpace;
+        if(!space)continue;
+
+        const pose=frame.getPose(space,ref);
+        if(!pose)continue;
+
+        const hand=hands[source.handedness];
+        const p=pose.transform.position;
+        hand.active=true;
+        hand.pos.set(p.x,p.y,p.z);
+
+        if(hand.first||dt<=0){
+          hand.prevPos.copy(hand.pos);
+          hand.velocity.set(0,0,0);
+          hand.first=false;
+        }else{
+          hand.rawVelocity.copy(hand.pos).sub(hand.prevPos).divideScalar(dt);
+          if(hand.rawVelocity.lengthSq()>25)hand.rawVelocity.setLength(5);
+          hand.velocity.lerp(hand.rawVelocity,.35);
+          hand.prevPos.copy(hand.pos);
+        }
+      }
+
+      for(const hand of Object.values(hands)){
+        if(!hand.active){
+          hand.first=true;
+          hand.velocity.set(0,0,0);
+        }
+      }
+    }
+
     let first=true,elapsed=0;
 
     function resetHeadTracking(){
       first=true;
       headVelocity.set(0,0,0);
       turnVelocity.set(0,0,0);
+      resetHands();
     }
 
     function updateHead(dt,frame){
@@ -477,7 +570,77 @@
           }
         }
 
-        [ax,ay,az]=limit3(ax,ay,az,CONFIG.maxForce*2.35);
+        // 右手：召唤。靠近手掌后进入小范围环绕，避免全部坍缩到一个点。
+        const right=hands.right;
+        if(right.active&&CONFIG.rightSummonScale>0){
+          const dx=right.pos.x-px,dy=right.pos.y-py,dz=right.pos.z-pz;
+          const d2=dx*dx+dy*dy+dz*dz;
+          const r=CONFIG.rightSummonRadius;
+
+          if(d2<r*r){
+            const d=Math.sqrt(Math.max(d2,.000001));
+            const proximity=1-d/r;
+            const inv=1/d;
+            const target=CONFIG.rightOrbitRadius;
+            const scale=CONFIG.rightSummonScale;
+
+            if(d>target){
+              const pull=CONFIG.rightSummonWeight*proximity*Math.min(1,(d-target)/Math.max(target,.001))*scale;
+              ax+=dx*inv*pull;
+              ay+=dy*inv*pull;
+              az+=dz*inv*pull;
+            }else{
+              const push=CONFIG.rightSummonWeight*.9*(1-d/target)*scale;
+              ax-=dx*inv*push;
+              ay-=dy*inv*push;
+              az-=dz*inv*push;
+            }
+
+            // 绕右手的轻微切向力，让“召唤”看起来像聚拢后盘旋。
+            const tx=-dz,tz=dx;
+            const tl=Math.sqrt(tx*tx+tz*tz);
+            if(tl>.00001){
+              const orbit=CONFIG.rightOrbitWeight*proximity*scale;
+              ax+=tx/tl*orbit;
+              az+=tz/tl*orbit;
+            }
+
+            // 手移动时，被召唤的光点稍微跟随手的运动。
+            ax+=right.velocity.x*.32*proximity*scale;
+            ay+=right.velocity.y*.32*proximity*scale;
+            az+=right.velocity.z*.32*proximity*scale;
+          }
+        }
+
+        // 左手：排斥。距离越近越强，快速挥动时会把附近光点沿挥动方向扫开。
+        const left=hands.left;
+        if(left.active&&CONFIG.leftRepelScale>0){
+          const dx=px-left.pos.x,dy=py-left.pos.y,dz=pz-left.pos.z;
+          const d2=dx*dx+dy*dy+dz*dz;
+          const r=CONFIG.leftRepelRadius;
+
+          if(d2<r*r){
+            const d=Math.sqrt(Math.max(d2,.000001));
+            const inv=1/d;
+            const proximity=1-d/r;
+            const scale=CONFIG.leftRepelScale;
+            const repel=CONFIG.leftRepelWeight*proximity*proximity*scale;
+
+            ax+=dx*inv*repel;
+            ay+=dy*inv*repel;
+            az+=dz*inv*repel;
+
+            const handSpeed=Math.min(3,left.velocity.length());
+            if(handSpeed>.02){
+              const sweep=CONFIG.leftSweepWeight*proximity*scale;
+              ax+=left.velocity.x*sweep;
+              ay+=left.velocity.y*sweep;
+              az+=left.velocity.z*sweep;
+            }
+          }
+        }
+
+        [ax,ay,az]=limit3(ax,ay,az,CONFIG.maxForce*3.4);
 
         let nvx=vx+ax*dt,nvy=vy+ay*dt,nvz=vz+az*dt;
         let sp=Math.sqrt(nvx*nvx+nvy*nvy+nvz*nvz);
@@ -514,7 +677,7 @@
       ui.info.style.display='block';
       ui.reopen.style.display='block';
       vrButton.style.display='';
-      ui.status.textContent='模拟已运行，点击 ENTER VR 进入沉浸模式';
+      ui.status.textContent='模拟已运行：右手召唤，左手排斥；点击 ENTER VR 进入沉浸模式';
     });
 
     ui.reopen.addEventListener('click',()=>{
@@ -541,6 +704,7 @@
 
       if(running){
         updateHead(dt,frame);
+        updateHands(dt,frame);
         const simDt=dt*CONFIG.speedScale;
         elapsed+=simDt;
         updateFlock(simDt);
