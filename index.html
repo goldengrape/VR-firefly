@@ -120,6 +120,19 @@
         <div class="hint">左手靠近会推开光点；快速挥动左手时会产生更明显的扫动效果。</div>
       </div>
 
+      <div class="setting">
+        <label for="curvature">空间曲率可视化</label>
+        <output id="curvatureOut">1.00×</output>
+        <input id="curvature" type="range" min="0" max="3" step="0.05" value="1">
+        <div class="hint">鸟群被视作质量云，三维空间网格根据其弱场势场发生形变。0 表示保持平直网格。</div>
+      </div>
+
+      <div class="setting">
+        <label for="gridSize">空间网格范围</label>
+        <output id="gridSizeOut">5.0 m</output>
+        <input id="gridSize" type="range" min="3" max="8" step="0.5" value="5">
+      </div>
+
       <div class="actions">
         <button id="start">开始运行</button>
         <button id="reset" type="button">恢复默认</button>
@@ -129,7 +142,7 @@
 
   <div id="info">
     <b>VR Firefly</b><br>
-    白色光点按 Boids 规则飞行。右手召唤，左手排斥；头部运动也会扰动它们。
+    白色光点按 Boids 规则飞行，并作为“质量云”扭曲周围三维空间网格。右手召唤，左手排斥。
     <div id="status">模拟已运行</div>
   </div>
 
@@ -148,6 +161,7 @@
       headRepelWeight:3.2,headMotionWeight:1.45,headTurnWeight:1.15,
       rightSummonRadius:2.1,rightOrbitRadius:.28,rightSummonWeight:2.25,rightOrbitWeight:.55,
       leftRepelRadius:1.55,leftRepelWeight:4.4,leftSweepWeight:1.65,
+      gridResolution:9,gridSoftening:.42,gridDisplacement:.19,
       opacity:.95
     };
 
@@ -160,6 +174,8 @@
       pointSize:.055,
       rightSummonScale:1,
       leftRepelScale:1,
+      curvatureScale:1,
+      gridSize:5,
       ...BASE
     };
 
@@ -178,6 +194,8 @@
       size:document.querySelector('#size'),
       rightSummon:document.querySelector('#rightSummon'),
       leftRepel:document.querySelector('#leftRepel'),
+      curvature:document.querySelector('#curvature'),
+      gridSize:document.querySelector('#gridSize'),
       countOut:document.querySelector('#countOut'),
       speedOut:document.querySelector('#speedOut'),
       wanderOut:document.querySelector('#wanderOut'),
@@ -185,12 +203,14 @@
       headOut:document.querySelector('#headOut'),
       sizeOut:document.querySelector('#sizeOut'),
       rightSummonOut:document.querySelector('#rightSummonOut'),
-      leftRepelOut:document.querySelector('#leftRepelOut')
+      leftRepelOut:document.querySelector('#leftRepelOut'),
+      curvatureOut:document.querySelector('#curvatureOut'),
+      gridSizeOut:document.querySelector('#gridSizeOut')
     };
 
     const defaults={
       count:'240',speed:'1',wander:'0.48',radius:'3.1',head:'1',size:'0.055',
-      rightSummon:'1',leftRepel:'1'
+      rightSummon:'1',leftRepel:'1',curvature:'1',gridSize:'5'
     };
 
     function syncOutputs(){
@@ -202,9 +222,11 @@
       ui.sizeOut.value=Number(ui.size.value).toFixed(3);
       ui.rightSummonOut.value=Number(ui.rightSummon.value).toFixed(2)+'×';
       ui.leftRepelOut.value=Number(ui.leftRepel.value).toFixed(2)+'×';
+      ui.curvatureOut.value=Number(ui.curvature.value).toFixed(2)+'×';
+      ui.gridSizeOut.value=Number(ui.gridSize.value).toFixed(1)+' m';
     }
 
-    ['count','speed','wander','radius','head','size','rightSummon','leftRepel'].forEach(k=>{
+    ['count','speed','wander','radius','head','size','rightSummon','leftRepel','curvature','gridSize'].forEach(k=>{
       ui[k].addEventListener('input',syncOutputs);
     });
     syncOutputs();
@@ -250,6 +272,143 @@
     }
 
     const glow=glowTexture();
+
+    // 三维空间网格。每个唯一格点先计算一次形变，再复制到相邻线段端点。
+    let spaceGrid=null;
+    let gridGeometry=null;
+    let gridMaterial=null;
+    let gridPosAttr=null;
+    let gridBaseNodes=null;
+    let gridWarpedNodes=null;
+    let gridEdges=null;
+
+    function destroySpaceGrid(){
+      if(spaceGrid)scene.remove(spaceGrid);
+      if(gridGeometry)gridGeometry.dispose();
+      if(gridMaterial)gridMaterial.dispose();
+      spaceGrid=gridGeometry=gridMaterial=gridPosAttr=null;
+      gridBaseNodes=gridWarpedNodes=gridEdges=null;
+    }
+
+    function createSpaceGrid(){
+      destroySpaceGrid();
+
+      const R=CONFIG.gridResolution;
+      const half=CONFIG.gridSize*.5;
+      const step=CONFIG.gridSize/(R-1);
+      const nodeCount=R*R*R;
+
+      gridBaseNodes=new Float32Array(nodeCount*3);
+      gridWarpedNodes=new Float32Array(nodeCount*3);
+
+      const idx=(x,y,z)=>x+R*(y+R*z);
+
+      for(let z=0;z<R;z++){
+        for(let y=0;y<R;y++){
+          for(let x=0;x<R;x++){
+            const i=idx(x,y,z)*3;
+            gridBaseNodes[i]=(x-(R-1)/2)*step;
+            gridBaseNodes[i+1]=1.6+(y-(R-1)/2)*step;
+            gridBaseNodes[i+2]=(z-(R-1)/2)*step;
+          }
+        }
+      }
+
+      const edges=[];
+      for(let z=0;z<R;z++){
+        for(let y=0;y<R;y++){
+          for(let x=0;x<R;x++){
+            const a=idx(x,y,z);
+            if(x<R-1)edges.push(a,idx(x+1,y,z));
+            if(y<R-1)edges.push(a,idx(x,y+1,z));
+            if(z<R-1)edges.push(a,idx(x,y,z+1));
+          }
+        }
+      }
+      gridEdges=new Uint32Array(edges);
+
+      const linePositions=new Float32Array(gridEdges.length*3);
+      gridGeometry=new THREE.BufferGeometry();
+      gridPosAttr=new THREE.BufferAttribute(linePositions,3);
+      gridPosAttr.setUsage(THREE.DynamicDrawUsage);
+      gridGeometry.setAttribute('position',gridPosAttr);
+
+      gridMaterial=new THREE.LineBasicMaterial({
+        color:0xffffff,
+        transparent:true,
+        opacity:.16,
+        depthWrite:false,
+        blending:THREE.AdditiveBlending
+      });
+
+      spaceGrid=new THREE.LineSegments(gridGeometry,gridMaterial);
+      spaceGrid.frustumCulled=false;
+      scene.add(spaceGrid);
+
+      updateSpaceGrid();
+    }
+
+    function updateSpaceGrid(){
+      if(!spaceGrid||!gridBaseNodes||!positions||N===0)return;
+
+      const soft2=CONFIG.gridSoftening*CONFIG.gridSoftening;
+      const massNorm=1/Math.max(1,N);
+      const strength=CONFIG.gridDisplacement*CONFIG.curvatureScale;
+
+      for(let n=0;n<gridBaseNodes.length;n+=3){
+        const bx=gridBaseNodes[n];
+        const by=gridBaseNodes[n+1];
+        const bz=gridBaseNodes[n+2];
+
+        let gx=0,gy=0,gz=0,potential=0;
+
+        // 软化的 1/r 势与其梯度。它是弱场近似的视觉映射，
+        // 不是把四维时空严格嵌入三维欧氏空间。
+        for(let j=0;j<N;j++){
+          const k=j*3;
+          const dx=positions[k]-bx;
+          const dy=positions[k+1]-by;
+          const dz=positions[k+2]-bz;
+          const r2=dx*dx+dy*dy+dz*dz+soft2;
+          const invR=1/Math.sqrt(r2);
+          const invR3=invR/r2;
+
+          gx+=dx*invR3;
+          gy+=dy*invR3;
+          gz+=dz*invR3;
+          potential+=invR;
+        }
+
+        gx*=massNorm;
+        gy*=massNorm;
+        gz*=massNorm;
+        potential*=massNorm;
+
+        // 势越深，局部形变越强；限制最大位移，避免网格翻折得过于剧烈。
+        const fieldLen=Math.sqrt(gx*gx+gy*gy+gz*gz);
+        const amp=Math.min(.72,strength*(.55+potential*.34));
+
+        if(fieldLen>.000001){
+          gridWarpedNodes[n]=bx+gx/fieldLen*amp;
+          gridWarpedNodes[n+1]=by+gy/fieldLen*amp;
+          gridWarpedNodes[n+2]=bz+gz/fieldLen*amp;
+        }else{
+          gridWarpedNodes[n]=bx;
+          gridWarpedNodes[n+1]=by;
+          gridWarpedNodes[n+2]=bz;
+        }
+      }
+
+      const out=gridPosAttr.array;
+      for(let e=0;e<gridEdges.length;e++){
+        const node=gridEdges[e]*3;
+        const o=e*3;
+        out[o]=gridWarpedNodes[node];
+        out[o+1]=gridWarpedNodes[node+1];
+        out[o+2]=gridWarpedNodes[node+2];
+      }
+      gridPosAttr.needsUpdate=true;
+    }
 
     let N=0;
     let positions=null,velocities=null,phases=null;
@@ -329,6 +488,8 @@
       CONFIG.pointSize=Number(ui.size.value);
       CONFIG.rightSummonScale=Number(ui.rightSummon.value);
       CONFIG.leftRepelScale=Number(ui.leftRepel.value);
+      CONFIG.curvatureScale=Number(ui.curvature.value);
+      CONFIG.gridSize=Number(ui.gridSize.value);
     }
 
     const headPos=new THREE.Vector3(0,1.6,0);
@@ -669,6 +830,7 @@
     ui.start.addEventListener('click',()=>{
       applySettings();
       createFlock();
+      createSpaceGrid();
       resetHeadTracking();
       elapsed=0;
       running=true;
@@ -677,13 +839,14 @@
       ui.info.style.display='block';
       ui.reopen.style.display='block';
       vrButton.style.display='';
-      ui.status.textContent='模拟已运行：右手召唤，左手排斥；点击 ENTER VR 进入沉浸模式';
+      ui.status.textContent='模拟已运行：鸟群作为质量云扭曲三维空间网格；右手召唤，左手排斥';
     });
 
     ui.reopen.addEventListener('click',()=>{
       if(renderer.xr.isPresenting)return;
       running=false;
       destroyFlock();
+      destroySpaceGrid();
       vrButton.style.display='none';
       ui.info.style.display='none';
       ui.reopen.style.display='none';
@@ -708,6 +871,7 @@
         const simDt=dt*CONFIG.speedScale;
         elapsed+=simDt;
         updateFlock(simDt);
+        updateSpaceGrid();
       }
 
       renderer.render(scene,camera);
